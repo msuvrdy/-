@@ -1,0 +1,160 @@
+请根据以下技术规格，在文件夹 D/ 下编写文件:
+  D/D_process_mel.py          ——预处理脚本
+  D/D_compute_norm_mel.py     ——归一化统计脚本
+  D/D_train_experiment_e.py   ——训练脚本
+
+所有输出目录均放在 D/ 下。
+
+==============================================================
+零、准备 D/processed_data/experiment_mel_32/batches/ 目录
+==============================================================
+
+==============================================================
+一、预处理 D/D_process_mel.py
+==============================================================
+
+命令行: python D_process_mel.py <BASE_DIR> <OUT_DIR> <BATCH_IDX>
+示例:   python D_process_mel.py "2_CSV_Data_Files" "D/processed_data/experiment_mel_32/batches" 0
+
+输入：UOEMD-VAFCVS 数据集 CSV 文件，路径结构为 2_CSV_Data_Files/1_Unloaded_Condition/ 和 2_CSV_Data_Files/2_Loaded_Condition/
+文件命名：{故障大类}_{故障子类}_{转速编号}_{负载编号}.csv，如 B_R_1_0.csv
+
+参数：
+  FS = 42000
+  WINDOW = 4096 (滑动窗口点数)
+  STEP = 2048 (步长)
+  N_FFT = 256
+  N_MELS = 32
+  NPERSEG = 256
+  NOVERLAP = 128 (hop=128)
+  F_MIN = 0
+  F_MAX = 21000
+
+处理流程：
+1. 读取 CSV 5 通道 (Acc1, Mic, Acc2, Acc3, Temp)
+2. 通道 0-3 去直流: sig = sig - mean(sig)
+3. 通道 0-3 去趋势: 最小二乘拟合线性趋势后减去
+4. 滑动窗口: window=4096, step=2048
+   - 0 ~ 6.5s → train 段 (132 窗/文件)
+   - 6.5 ~ 8.0s → val 段 (29 窗/文件)
+   - 8.0 ~ 10.0s → test 段 (40 窗/文件)
+5. 每窗 STFT: n_fft=256, nperseg=256, hop=128
+6. Mel 滤波: 32 三角滤波器覆盖 0~21000Hz, 函数 make_mel_filterbank
+7. dB 转换: 20*log10(max(|mel|, 1e-10)), clip 到 [-80, inf)
+8. 温度: 每窗内 temp 通道均值
+9. 输出 npz: 每 batch 存 tst(通道0-3的Mel 四维数组), vst, est, tvt(temp train), vvt, evt, tlt(labels), vlt, elt
+10. 故障标签映射: H_H=0, R_U=1, R_M=2, S_W=3, V_U=4, B_R=5, K_A=6, F_B=7
+11. 每个 npz 存 8 个文件 (batch_size=8)
+12. 只处理恒速 sp≤4, 跳过 sp>4
+13. 输出到 D/processed_data/experiment_mel_32/batches/batch_XX.npz (共 8 个)
+
+==============================================================
+二、归一化统计 D/D_compute_norm_mel.py
+==============================================================
+
+从所有 batch 的 tst 数据计算 mean/std (axis 0,3 keepdims)，和 tvt 的 min/max
+保存到 D/processed_data/experiment_mel_32/norm_stats.npz
+键名 stft_mean, stft_std, temp_min, temp_max
+
+==============================================================
+三、训练 D/D_train_experiment_e.py
+==============================================================
+
+命令行: python D_train_experiment_e.py --data_dir D/processed_data/experiment_mel_32/batches --epochs 50 --batch_size 64 --device cuda --lambda_sc 0.12 --mask_width 3
+输出: D/results_exp_e/
+
+数据集类 AllWindowDataset:
+- 加载 batch npz, 解析文件排序确定 speed/load/fault
+- 文件排序: 字母序, unloaded(0-3批) 先于 loaded(4-7批)
+- 故障顺序: ['B_R','F_B','H_H','K_A','R_M','R_U','S_W','V_U']
+- 每批 2 故障 × 4 转速 = 8 文件
+- 每文件贡献: train 132 / val 29 / test 40 窗口
+- 根据 speed_ids 和 load_id 过滤文件
+- 合并 train+val+test 三段为全窗口池
+- 支持 indices[:n_train] 和 indices[n_train:] 做 8:2 拆分
+- __getitem__ 返回 (mel, temp, label, speed)
+- norm_stats 用动态维度: n_freq = int(st['stft_mean'].size // 4); view(4, n_freq, 1)
+
+模型类 (参数量 552,558):
+  class ChannelAttention: FC(256→32→256), sigmoid, 通道乘法
+  class SpatialAttention: Conv2d(2→1, k7, p3), sigmoid, 空间乘法
+  class CBAM: ChannelAttn + SpatialAttn (reduction=8)
+
+  class LightCNN_CBAM_SupCon:
+    conv1: Conv2d(4→32, k5, s2, p2) + BN + ReLU  → (B,32,16,16)
+    conv2: Conv2d(32→64, k3, s2, p1) + BN + ReLU  → (B,64,8,8)
+    conv3: Conv2d(64→128, k3, s2, p1) + BN + ReLU → (B,128,4,4)
+    conv4: Conv2d(128→256, k3, s2, p1) + BN + ReLU→ (B,256,2,2)
+    CBAM(256)
+    AdaptiveAvgPool2d(1,1) → Flatten → (B,256)
+    temp: Linear(1→16)+ReLU
+    Concat → (B, 272)
+    Classifier: 272→128+BN+ReLU+Dropout(0.5)→8
+    Projection: 272→256+ReLU→128→L2归一化 (SupCon用)
+    模型还须包含 cbam2=CBAM(64) 和 cbam3=CBAM(128) 但不参与前向
+
+损失函数:
+  def mixup_data(x, y, alpha=0.2): 返回 (mixed_x, y_a, y_b, lam)
+  def mixup_criterion(criterion, pred, y_a, y_b, lam): return lam*crit(pred,y_a)+(1-lam)*crit(pred,y_b)
+  def supcon_loss(features, labels, temperature=0.07):
+    features: (N, D) L2归一化, labels: (N,)
+    sim = matmul(features, features.T) / temperature
+    pos_mask = (labels == labels.T), 对角线置0
+    对每样本 i:
+      正样本和 = sum(sim[i] * pos_mask[i])
+      去分母 logsumexp(sim[i], 排除自身)
+      loss_i = -正样本和/正样本数 + logsumexp
+    返回有正样本的 loss_i 的均值
+
+训练循环 train_epoch:
+  对每个 batch (mel, temp, labels, speeds) (注意loader返回4个元素):
+    1. 频域掩蔽生成第二视图:
+       mel_mask = mel.clone()
+       每样本随机 1-2 条频带, 宽 mask_width//2 ~ mask_width bin
+       掩蔽区域该样本全局均值填充
+    2. 拼接: mel_both=[mel, mel_mask], temp_both=[temp, temp], labels_both=[labels, labels]
+    3. 前向: logits(2B,8), embed(2B,128) = model(mel_both, temp_both, return_embedding=True)
+       model.forward: feat = forward_features(mel,temp); logits = classify(feat); if return_embedding: return logits, project(feat)
+    4. L_cls = CrossEntropy(logits[:B], labels, label_smoothing=0.1)
+    5. L_supcon = supcon_loss(embed, labels_both, temperature=0.07)
+    6. loss = L_cls + 0.12 * L_supcon
+    7. MixUp: mel_mix, y_a, y_b, lam = mixup_data(mel, labels, alpha=0.2)
+       logits_mixed = model(mel_mixed, temp)
+       mix_loss = mixup_criterion(criterion, logits_mixed, y_a, y_b, lam)
+    8. total = loss + mix_loss
+
+评估 evaluate:
+  for mel, temp, labels, speeds in loader:
+    outputs = model(mel, temp)
+    loss += CE(outputs, labels)
+    收集 preds 和 labels
+  返回 (avg_loss, accuracy, preds_list, labels_list)
+
+超参:
+  optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+  scheduler = CosineAnnealingLR(optimizer, T_max=50)
+  criterion = CrossEntropyLoss(label_smoothing=0.1)
+  Batch size: 64
+  Label smoothing: 0.1
+  MixUp alpha: 0.2
+  SupCon lambda: 0.12
+  SupCon temperature: 0.07
+  mask_width: 3 (宽 1-3 bin)
+  n_masks_max: 2 (1或2条频带)
+  Seed: 42
+  patience: 15
+
+4-fold LOSO:
+  Fold 1: train speeds [2,3,4] test speed 1 (30,45,60→15Hz)
+  Fold 2: train speeds [1,3,4] test speed 2 (15,45,60→30Hz)
+  Fold 3: train speeds [1,2,4] test speed 3 (15,30,60→45Hz)
+  Fold 4: train speeds [1,2,3] test speed 4 (15,30,45→60Hz)
+  只使用空载 (load=0)
+
+评估:
+  每 fold 输出 TEST Accuracy, 每类 Accuracy, Classification Report, Confusion Matrix
+  最后输出四折平均括号内标准差
+
+==============================================================
+期望结果: 四折平均约 87%, Fold1~91%, Fold2~95%, Fold3~87%, Fold4~75%
+==============================================================
