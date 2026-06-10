@@ -17,8 +17,13 @@ D/D_processed_data/
 **/batches/*.npz
 norm_stats.npz
 
-# 原始 CSV 数据集（体积很大，单独备份）
+# 原始数据集（体积很大，单独备份，不要进 Git）
 2_CSV_Data_Files/
+3_MatLab_Data_Files/
+1_Time/
+*.mat
+*.pdf
+_yin_lfpe_extract.txt
 
 # IDE / 系统
 .idea/
